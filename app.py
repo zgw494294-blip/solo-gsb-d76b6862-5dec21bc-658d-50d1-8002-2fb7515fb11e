@@ -7,6 +7,8 @@
 - 改稿立即使针对它的已交意见失效；提交绑定所读稿件版本，过期提交拒绝且不覆盖有效意见。
 - 每篇当前稿都有有效意见时才可一次公布；公布后作者可见匿名意见，稿件与意见锁定。
 - 所有写操作在 BEGIN IMMEDIATE 事务内"先检查后变更"，拒绝即整体回滚，不留部分变更。
+- 状态读取（参与页、主持台）在单个只读事务内完成：整个响应取自同一快照；
+  WAL 下读取不阻塞其他连接的写入，写入也不阻塞读取。
 """
 
 import os
@@ -212,32 +214,40 @@ def create_session():
 @app.get("/api/h/<host_token>")
 def host_status(host_token):
     conn = get_db()
-    session = find_session_by_host(conn, host_token)
-    if session is None:
-        return err("主持链接无效", 404)
-    parts = conn.execute(
-        "SELECT * FROM participants WHERE session_id=? ORDER BY position",
-        (session["id"],),
-    ).fetchall()
-    reviewers = []
-    can_publish = not session["published"]
-    for p in parts:
-        target = get_target(conn, session["id"], p["position"])
-        review = find_review_by_reviewer(conn, session["id"], p["id"])
-        submitted = review_is_current(review, target)
-        if not submitted:
-            can_publish = False
-        reviewers.append({"name": p["name"], "submitted": submitted})
-    return jsonify(
-        {
-            "published": bool(session["published"]),
-            "can_publish": can_publish,
-            "reviewers": reviewers,
-            "links": [
-                {"name": p["name"], "url": f"/p/{p['token']}"} for p in parts
-            ],
-        }
-    )
+    try:
+        # 只读事务：整个响应取自同一快照；WAL 下不阻塞其他连接的写入
+        conn.execute("BEGIN")
+        session = find_session_by_host(conn, host_token)
+        if session is None:
+            conn.rollback()
+            return err("主持链接无效", 404)
+        parts = conn.execute(
+            "SELECT * FROM participants WHERE session_id=? ORDER BY position",
+            (session["id"],),
+        ).fetchall()
+        reviewers = []
+        can_publish = not session["published"]
+        for p in parts:
+            target = get_target(conn, session["id"], p["position"])
+            review = find_review_by_reviewer(conn, session["id"], p["id"])
+            submitted = review_is_current(review, target)
+            if not submitted:
+                can_publish = False
+            reviewers.append({"name": p["name"], "submitted": submitted})
+        conn.commit()
+        return jsonify(
+            {
+                "published": bool(session["published"]),
+                "can_publish": can_publish,
+                "reviewers": reviewers,
+                "links": [
+                    {"name": p["name"], "url": f"/p/{p['token']}"} for p in parts
+                ],
+            }
+        )
+    except Exception:
+        conn.rollback()
+        raise
 
 
 @app.post("/api/h/<host_token>/publish")
@@ -279,45 +289,54 @@ def publish(host_token):
 
 @app.get("/api/p/<token>")
 def participant_state(token):
-    """参与页数据：不含他人姓名与任何私密链接；公布前不含收到的意见。"""
+    """参与页数据：同一快照读取；不含他人姓名与任何私密链接；公布前不含收到的意见。"""
     conn = get_db()
-    me = find_participant(conn, token)
-    if me is None:
-        return err("个人链接无效", 404)
-    session = conn.execute(
-        "SELECT * FROM sessions WHERE id=?", (me["session_id"],)
-    ).fetchone()
-    published = bool(session["published"])
-    target = get_target(conn, me["session_id"], me["position"])
-    my_review = find_review_by_reviewer(conn, me["session_id"], me["id"])
-
-    resp = {
-        "name": me["name"],
-        "manuscript": me["manuscript"],
-        "version": me["version"],
-        "published": published,
-        # 匿名：不返回被评稿件作者的姓名
-        "assignment": {
-            "manuscript": target["manuscript"],
-            "version": target["version"],
-        },
-        "my_review": None,
-        "received": None,
-    }
-    if my_review is not None:
-        resp["my_review"] = {
-            "content": my_review["content"],
-            "version": my_review["target_version"],
-            "valid": review_is_current(my_review, target),
-        }
-    if published:
-        # 匿名：只返回意见内容，不返回评审人任何信息
-        row = conn.execute(
-            "SELECT content FROM reviews WHERE target_id=? AND valid=1 AND target_version=?",
-            (me["id"], me["version"]),
+    try:
+        # 只读事务：本人稿件、分配稿件、版本、意见与公布状态取自同一快照；
+        # WAL 下读取暂停期间其他连接仍可完成合法写入
+        conn.execute("BEGIN")
+        me = find_participant(conn, token)
+        if me is None:
+            conn.rollback()
+            return err("个人链接无效", 404)
+        session = conn.execute(
+            "SELECT * FROM sessions WHERE id=?", (me["session_id"],)
         ).fetchone()
-        resp["received"] = row["content"] if row else None
-    return jsonify(resp)
+        published = bool(session["published"])
+        target = get_target(conn, me["session_id"], me["position"])
+        my_review = find_review_by_reviewer(conn, me["session_id"], me["id"])
+
+        resp = {
+            "name": me["name"],
+            "manuscript": me["manuscript"],
+            "version": me["version"],
+            "published": published,
+            # 匿名：不返回被评稿件作者的姓名
+            "assignment": {
+                "manuscript": target["manuscript"],
+                "version": target["version"],
+            },
+            "my_review": None,
+            "received": None,
+        }
+        if my_review is not None:
+            resp["my_review"] = {
+                "content": my_review["content"],
+                "version": my_review["target_version"],
+                "valid": review_is_current(my_review, target),
+            }
+        if published:
+            # 匿名：只返回意见内容，不返回评审人任何信息
+            row = conn.execute(
+                "SELECT content FROM reviews WHERE target_id=? AND valid=1 AND target_version=?",
+                (me["id"], me["version"]),
+            ).fetchone()
+            resp["received"] = row["content"] if row else None
+        conn.commit()
+        return jsonify(resp)
+    except Exception:
+        conn.rollback()
+        raise
 
 
 @app.put("/api/p/<token>/manuscript")
